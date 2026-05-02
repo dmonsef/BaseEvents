@@ -18,9 +18,25 @@ Before running any command, gather these inputs from the user by asking them dir
 2. **`ALLOWED_ORIGIN`** - the production URL where the tracker will run, including scheme, no trailing slash. Example: `https://hematic.com`. Multiple origins are comma-separated. **This is required.** The endpoint will reject all requests if it is not set. There is no wildcard fallback.
 3. **`SUPABASE_PROJECT_REF`** - the project ref from the Supabase dashboard URL (`https://supabase.com/dashboard/project/<THIS_IS_THE_REF>`). Only needed if the project is not already linked.
 
-Do not proceed until you have `SITE_SLUG` and `ALLOWED_ORIGIN`. `SUPABASE_PROJECT_REF` is only required if `supabase/config.toml` does not already exist or is not linked.
+**Normalize and validate the inputs before continuing:**
+
+- If the user gives a `SITE_SLUG` with uppercase, spaces, or other invalid chars, lowercase and slug-clean it, then read the result back to them for confirmation before saving. Do not silently accept invalid input.
+- If `ALLOWED_ORIGIN` has a trailing slash, strip it. (`https://example.com/` becomes `https://example.com`.)
+- If `ALLOWED_ORIGIN` is missing the scheme, prepend `https://`. (`example.com` becomes `https://example.com`.)
+- If `ALLOWED_ORIGIN` includes a path or query (`https://example.com/dashboard?foo=bar`), strip everything after the host so only `https://<host>` remains.
+- If the user is on localhost-only at this stage and has no production URL yet, accept `http://localhost:3000` (or whatever port) as the value but tell them they will need to add the production origin to `BASEEVENTS_ALLOWED_ORIGINS` before going live, and that the env var is comma-separated.
+
+Do not proceed until you have a normalized `SITE_SLUG` and `ALLOWED_ORIGIN`. `SUPABASE_PROJECT_REF` is only required if `supabase/config.toml` does not already exist or is not linked.
 
 If the user does not know their project ref, tell them to open the Supabase dashboard, click their project, and copy the string after `/project/` in the URL.
+
+**Detect the operating system once and remember it for later steps:**
+
+```bash
+uname -s 2>/dev/null || echo "WINDOWS_OR_UNKNOWN"
+```
+
+Mac returns `Darwin`. Linux returns `Linux`. Windows PowerShell returns either `WINDOWS_OR_UNKNOWN` (because `uname` is not present) or, on WSL/Git Bash, `MINGW64_NT-*` or `Linux`. Use this in section 3 to pick the right timestamp command and in section 6 for any Windows-specific notes.
 
 ---
 
@@ -77,12 +93,25 @@ Replace `SUPABASE_PROJECT_REF` with the value the user gave you. If this fails a
 
 Create a new migration file. Use a timestamped filename to match Supabase conventions.
 
+**On Mac/Linux/WSL/Git Bash:**
+
 ```bash
 mkdir -p supabase/migrations
 TIMESTAMP=$(date -u +"%Y%m%d%H%M%S")
 MIGRATION_FILE="supabase/migrations/${TIMESTAMP}_baseevents_schema.sql"
 echo "Creating $MIGRATION_FILE"
 ```
+
+**On native Windows PowerShell** (no `date` command available the same way):
+
+```powershell
+New-Item -ItemType Directory -Force -Path supabase/migrations | Out-Null
+$timestamp = (Get-Date -Format "yyyyMMddHHmmss")
+$migrationFile = "supabase/migrations/${timestamp}_baseevents_schema.sql"
+Write-Host "Creating $migrationFile"
+```
+
+If neither shell is available, just hardcode a timestamp in the filename. The format is `YYYYMMDDHHMMSS` followed by `_baseevents_schema.sql`. Example: `20260115093000_baseevents_schema.sql`. Supabase only requires that migrations be in lexicographic order; it does not parse the timestamp.
 
 Write the following content to `$MIGRATION_FILE`:
 
@@ -1052,6 +1081,27 @@ Replace both `SITE_SLUG` and `ENDPOINT_URL` with the actual values. Do not leave
 
 ## 6. VERIFY
 
+**STOP. Before running any verify command, confirm with the user that the env vars/secrets are actually set.** This is the most common point of failure in installs done by an agent. Do not skip this check, do not assume the user did it just because the runbook said to.
+
+**For the Vercel route handler path (4a):**
+
+Ask the user to confirm they have set all four required env vars in Vercel (Project Settings > Environment Variables):
+
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `IP_HASH_SALT`
+- `BASEEVENTS_ALLOWED_ORIGINS`
+
+If the user is testing locally first, those env vars also need to be in `.env.local` at the project root. Confirm one or the other is true before proceeding.
+
+**For the Edge Function path (4b):**
+
+Ask the user to run `supabase secrets list` and confirm the output includes both `IP_HASH_SALT` and `ALLOWED_ORIGINS`. If either is missing, set it now before running the verify curl.
+
+Do not proceed until the user confirms.
+
+---
+
 Run a test request against the deployed endpoint. Use the actual `ALLOWED_ORIGIN` value from step 0 (the request will be rejected without a valid Origin header).
 
 For Vercel-hosted Next.js projects, test the local route with fake Vercel geo headers and a valid origin:
@@ -1103,6 +1153,42 @@ If the curl returns a 5xx error, check:
 - For Vercel route ingestion: `SUPABASE_SERVICE_ROLE_KEY`, `IP_HASH_SALT`, and `BASEEVENTS_ALLOWED_ORIGINS` are all set in the Vercel project.
 - For Edge Function: `supabase secrets list` shows `IP_HASH_SALT` and `ALLOWED_ORIGINS`. The function deployed (rerun `supabase functions deploy ingest --no-verify-jwt`).
 - The schema migration ran (check `supabase/migrations/` for the file and re-run `supabase db push`).
+
+### Production smoke test (after deploy)
+
+Local verification confirms the code works. It does **not** confirm the production deployment works. Production has its own env vars and they are a common point of drift. After the user deploys to production, run one more curl against the live URL to confirm the full path works end-to-end.
+
+For Vercel-hosted Next.js (replace `https://your-prod-url.com` with the user's actual production domain, which should match `ALLOWED_ORIGIN`):
+
+```bash
+curl -X POST "https://your-prod-url.com/api/analytics" \
+  -H "Content-Type: application/json" \
+  -H "Origin: https://your-prod-url.com" \
+  -d '{"site":"SITE_SLUG","event_name":"prod_smoke_test","visitor_id":"v_prod_smoke"}'
+```
+
+For Edge Function deployments, the URL is the same as the local test (Supabase Edge Functions don't have a separate "preview" environment), so this step is only relevant for the Vercel path.
+
+Expected response: `{"ok":true}`. Then confirm the row in Supabase:
+
+```sql
+select created_at, country, city, event_name
+from public.events
+where visitor_id = 'v_prod_smoke';
+```
+
+Two things to look for that prove the production setup works:
+
+1. The row exists. (Confirms env vars are set in production.)
+2. `country` and `city` are populated. (Confirms Vercel geo headers are flowing through.)
+
+If `country` is null on a Vercel-deployed app, the request did not pass through Vercel's edge (most likely cause: the curl is hitting the wrong URL, or a custom domain is misconfigured). If the row is missing entirely, production env vars are not set. Open Vercel project settings, confirm all four are present in the Production environment specifically (Vercel's env-var scoping is per-environment), and redeploy if needed.
+
+Delete the smoke test row when confirmed:
+
+```sql
+delete from public.events where visitor_id = 'v_prod_smoke';
+```
 
 ---
 
@@ -1279,19 +1365,22 @@ These do not block the initial install but are worth flagging to the user before
 
 Before declaring done, confirm all of these:
 
-- [ ] Got `SITE_SLUG` and `ALLOWED_ORIGIN` from the user
+- [ ] Got `SITE_SLUG` and `ALLOWED_ORIGIN` from the user, normalized both (slug-cleaned, origin trailing slash stripped, scheme prepended if missing)
+- [ ] Detected operating system via `uname -s` and used the right timestamp command for the user's shell
 - [ ] Supabase CLI installed and authenticated
 - [ ] Project initialized and linked (`supabase/config.toml` exists, linked to a ref)
 - [ ] Migration file created in `supabase/migrations/` with BaseEvents schema and CHECK constraints
 - [ ] `supabase db push` ran successfully (or user confirmed they pasted SQL into dashboard)
 - [ ] For Vercel path: `app/api/analytics/route.ts` exists with correct content
-- [ ] For Vercel path: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `IP_HASH_SALT`, `BASEEVENTS_ALLOWED_ORIGINS` set in Vercel env
+- [ ] For Vercel path: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `IP_HASH_SALT`, `BASEEVENTS_ALLOWED_ORIGINS` set in Vercel env (or `.env.local` for local testing)
 - [ ] For Edge path: `supabase/functions/ingest/index.ts` exists with correct content
 - [ ] For Edge path: `IP_HASH_SALT` and `ALLOWED_ORIGINS` secrets set
 - [ ] For Edge path: `supabase functions deploy ingest --no-verify-jwt` ran successfully
 - [ ] `t.js` placed in the correct public directory (or the renamed equivalent)
 - [ ] Script tag added to the correct layout/HTML file with real `SITE_SLUG` and real endpoint URL
-- [ ] curl test with valid Origin returned `{"ok":true}`
+- [ ] **Stopped and confirmed with the user that env vars/secrets are actually set before running the verify curl**
+- [ ] Local curl test with valid Origin returned `{"ok":true}`
+- [ ] After production deploy: production smoke test curl returned `{"ok":true}` and the row in Supabase had `country` and `city` populated (Vercel path only)
 - [ ] `BASEEVENTS-QUERIES.md` written to project root
 - [ ] Printed summary to user, including the production considerations from section 9
 
